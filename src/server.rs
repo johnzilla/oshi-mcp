@@ -21,6 +21,11 @@ use crate::{
 };
 
 const MAX_METADATA_BYTES: usize = 16 * 1024;
+/// Added when a grant's outcome is unknown. Grants are idempotent per external_id, so
+/// retrying the same one is safe; minting a new id for the same action could pay twice.
+const GRANT_RETRY_HINT: &str = ". Check with lookup_reward using the same external_id, or \
+    retry with the same external_id, which never pays twice. Don't use a new external_id for \
+    this action.";
 
 #[derive(Clone)]
 pub struct OshiServer {
@@ -544,7 +549,14 @@ impl OshiServer {
             .client
             .post(self.client.url(&["events"]), Some(&body))
             .await
-            .map_err(|e| self.api_error(e))?;
+            .map_err(|e| {
+                let unknown = e.outcome_unknown;
+                let mut msg = self.api_error(e);
+                if unknown {
+                    msg.push_str(GRANT_RETRY_HINT);
+                }
+                msg
+            })?;
         let resp = self.scrub(resp);
         if resp.get("status").and_then(Value::as_str) == Some("insufficient_funds") {
             return Ok(format!(

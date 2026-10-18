@@ -1,11 +1,11 @@
 //! Thin HTTP client for the Oshi API Rewards REST API.
 
-use std::{fmt, time::Duration};
+use std::{error::Error as _, fmt, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use reqwest::{
     Method, Response, StatusCode,
-    header::{AUTHORIZATION, HeaderMap, HeaderValue, RETRY_AFTER},
+    header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, RETRY_AFTER},
     redirect::Policy,
 };
 use serde_json::Value;
@@ -15,6 +15,8 @@ use crate::config::ApiKey;
 
 pub const DEFAULT_BASE_URL: &str = "https://app.oshi.tech/api/rewards";
 
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_ERROR_BODY_CHARS: usize = 2000;
 
@@ -22,10 +24,21 @@ const MAX_ERROR_BODY_CHARS: usize = 2000;
 pub struct OshiClient {
     http: reqwest::Client,
     base: Url,
+    timeout: Duration,
 }
 
 impl OshiClient {
     pub fn new(api_key: &ApiKey, base_url: &str) -> Result<Self> {
+        Self::with_timeouts(api_key, base_url, CONNECT_TIMEOUT, REQUEST_TIMEOUT)
+    }
+
+    /// Like `new`, with explicit connect and whole-request timeouts.
+    pub fn with_timeouts(
+        api_key: &ApiKey,
+        base_url: &str,
+        connect: Duration,
+        request: Duration,
+    ) -> Result<Self> {
         let base = Url::parse(base_url).context("invalid base URL")?;
         if base.cannot_be_a_base() || !matches!(base.scheme(), "https" | "http") {
             bail!("base URL must be an http(s) URL");
@@ -42,10 +55,14 @@ impl OshiClient {
             .user_agent(concat!("oshi-mcp/", env!("CARGO_PKG_VERSION")))
             // The API never redirects; refusing to follow keeps the key on one host.
             .redirect(Policy::none())
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
+            .connect_timeout(connect)
+            .timeout(request)
             .build()?;
-        Ok(Self { http, base })
+        Ok(Self {
+            http,
+            base,
+            timeout: request,
+        })
     }
 
     /// Builds `{base}/{segments...}`, percent-encoding each segment so caller
@@ -83,27 +100,82 @@ impl OshiClient {
         if let Some(body) = body {
             req = req.json(body);
         }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| ApiError::new(format!("request to Oshi failed: {}", e.without_url())))?;
+        let resp = req.send().await.map_err(|e| self.transport_error(e))?;
 
         let status = resp.status();
-        let retry_after = resp
-            .headers()
-            .get(RETRY_AFTER)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned);
-        let bytes = read_capped(resp).await?;
+        let header = |name| {
+            resp.headers()
+                .get(name)
+                .and_then(|v: &HeaderValue| v.to_str().ok())
+                .map(str::to_owned)
+        };
+        let retry_after = header(RETRY_AFTER);
+        let content_type = header(CONTENT_TYPE).unwrap_or_default();
+        let bytes = self.read_capped(resp).await?;
 
         if !status.is_success() {
-            return Err(describe_error(status, retry_after.as_deref(), &bytes));
+            return Err(describe_error(
+                status,
+                retry_after.as_deref(),
+                &content_type,
+                &bytes,
+            ));
         }
+        // Oshi always answers success with JSON, so anything else means we
+        // can't tell what happened, even though the request was accepted.
+        let unreadable = |what: String| ApiError {
+            outcome_unknown: true,
+            ..ApiError::new(format!("Oshi returned {status} but {what}"))
+        };
         if bytes.iter().all(u8::is_ascii_whitespace) {
-            return Ok(Value::Null);
+            return Err(unreadable("an empty body".into()));
         }
-        serde_json::from_slice(&bytes)
-            .map_err(|e| ApiError::new(format!("Oshi returned invalid JSON ({status}): {e}")))
+        if is_html(&content_type, &bytes) {
+            return Err(unreadable("an HTML page instead of JSON".into()));
+        }
+        serde_json::from_slice(&bytes).map_err(|e| unreadable(format!("invalid JSON ({e})")))
+    }
+
+    async fn read_capped(&self, mut resp: Response) -> Result<Vec<u8>, ApiError> {
+        let mut buf = Vec::new();
+        while let Some(chunk) = resp.chunk().await.map_err(|e| self.transport_error(e))? {
+            if buf.len() + chunk.len() > MAX_RESPONSE_BYTES {
+                return Err(ApiError {
+                    outcome_unknown: true,
+                    ..ApiError::new(format!("Oshi response exceeded {MAX_RESPONSE_BYTES} bytes"))
+                });
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        Ok(buf)
+    }
+
+    fn transport_error(&self, e: reqwest::Error) -> ApiError {
+        // A failed connection means nothing was sent. Anything later (a timeout,
+        // a dropped connection) may have happened after Oshi acted on it.
+        let (summary, outcome_unknown) = if e.is_connect() {
+            ("couldn't connect to Oshi".to_owned(), false)
+        } else if e.is_timeout() {
+            (
+                format!("Oshi didn't respond within {}s", self.timeout.as_secs_f32()),
+                true,
+            )
+        } else {
+            ("the connection to Oshi failed".to_owned(), true)
+        };
+        // reqwest's top-level message is vague; the cause chain says what broke.
+        let e = e.without_url();
+        let mut detail = e.to_string();
+        let mut source = e.source();
+        while let Some(cause) = source {
+            detail.push_str(": ");
+            detail.push_str(&cause.to_string());
+            source = cause.source();
+        }
+        ApiError {
+            outcome_unknown,
+            ..ApiError::new(format!("{summary} ({detail})"))
+        }
     }
 }
 
@@ -114,6 +186,9 @@ pub struct ApiError {
     pub message: String,
     /// The error response body: parsed JSON, or the raw text as a JSON string.
     pub body: Option<Value>,
+    /// The request may have taken effect even though it reported failure,
+    /// e.g. it timed out after being sent, or Oshi's reply was unreadable.
+    pub outcome_unknown: bool,
 }
 
 impl ApiError {
@@ -121,6 +196,7 @@ impl ApiError {
         Self {
             message,
             body: None,
+            outcome_unknown: false,
         }
     }
 }
@@ -128,38 +204,40 @@ impl ApiError {
 impl fmt::Display for ApiError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.message)?;
-        let body = match &self.body {
-            None => return Ok(()),
-            Some(Value::String(text)) => text.clone(),
-            Some(v) => v.to_string(),
-        };
-        let shown: String = body.chars().take(MAX_ERROR_BODY_CHARS).collect();
-        write!(f, ": {shown}")?;
-        if shown.len() < body.len() {
-            f.write_str("…")?;
+        if let Some(body) = &self.body {
+            let body = match body {
+                Value::String(text) => text.clone(),
+                v => v.to_string(),
+            };
+            let shown: String = body.chars().take(MAX_ERROR_BODY_CHARS).collect();
+            write!(f, ": {shown}")?;
+            if shown.len() < body.len() {
+                f.write_str("…")?;
+            }
+        }
+        if self.outcome_unknown {
+            f.write_str(". The request may or may not have taken effect")?;
         }
         Ok(())
     }
 }
 
-async fn read_capped(mut resp: Response) -> Result<Vec<u8>, ApiError> {
-    let mut buf = Vec::new();
-    while let Some(chunk) = resp
-        .chunk()
-        .await
-        .map_err(|e| ApiError::new(format!("reading Oshi response failed: {}", e.without_url())))?
-    {
-        if buf.len() + chunk.len() > MAX_RESPONSE_BYTES {
-            return Err(ApiError::new(format!(
-                "Oshi response exceeded {MAX_RESPONSE_BYTES} bytes"
-            )));
-        }
-        buf.extend_from_slice(&chunk);
+fn is_html(content_type: &str, body: &[u8]) -> bool {
+    if content_type.to_ascii_lowercase().contains("text/html") {
+        return true;
     }
-    Ok(buf)
+    let start: String = String::from_utf8_lossy(&body[..body.len().min(512)])
+        .trim_start()
+        .to_ascii_lowercase();
+    start.starts_with("<!doctype html") || start.starts_with("<html")
 }
 
-fn describe_error(status: StatusCode, retry_after: Option<&str>, body: &[u8]) -> ApiError {
+fn describe_error(
+    status: StatusCode,
+    retry_after: Option<&str>,
+    content_type: &str,
+    body: &[u8],
+) -> ApiError {
     let mut msg = format!("Oshi API returned {status}");
     match status {
         StatusCode::UNAUTHORIZED => msg.push_str(" (check that OSHI_API_KEY is correct)"),
@@ -170,11 +248,27 @@ fn describe_error(status: StatusCode, retry_after: Option<&str>, body: &[u8]) ->
         s if s.is_redirection() => msg.push_str(" (unexpected redirect; not followed)"),
         _ => {}
     }
+    // Unknown routes and gateway failures come back as web pages, which are
+    // just noise to the model.
+    if is_html(content_type, body) {
+        msg.push_str(
+            " with an HTML page instead of JSON (an unknown endpoint, or a gateway error)",
+        );
+        return ApiError {
+            outcome_unknown: status.is_server_error(),
+            ..ApiError::new(msg)
+        };
+    }
     let text = String::from_utf8_lossy(body);
     let text = text.trim();
     let body = (!text.is_empty())
         .then(|| serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.to_owned())));
-    ApiError { message: msg, body }
+    ApiError {
+        message: msg,
+        body,
+        // A 5xx can come from a gateway after the backend already acted.
+        outcome_unknown: status.is_server_error(),
+    }
 }
 
 #[cfg(test)]
@@ -290,5 +384,113 @@ mod tests {
         let c = client(&server.uri());
         let err = c.get(c.url(&["campaigns"])).await.unwrap_err().to_string();
         assert!(err.contains("exceeded"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn refused_connection_means_nothing_was_sent() {
+        // Bind then release a port so nothing is listening on it. (Dropping a
+        // MockServer doesn't work: wiremock keeps pooled servers running.)
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let c = client(&format!("http://127.0.0.1:{port}"));
+        let err = c.get(c.url(&["campaigns"])).await.unwrap_err();
+        assert!(err.message.starts_with("couldn't connect to Oshi"), "{err}");
+        assert!(!err.outcome_unknown);
+    }
+
+    #[tokio::test]
+    async fn timeout_leaves_the_outcome_unknown() {
+        let server = MockServer::start().await;
+        Mock::given(path("/events"))
+            .respond_with(
+                ResponseTemplate::new(202)
+                    .set_body_json(json!({}))
+                    .set_delay(Duration::from_secs(2)),
+            )
+            .mount(&server)
+            .await;
+        let key = ApiKey::new("k").unwrap();
+        let c = OshiClient::with_timeouts(
+            &key,
+            &server.uri(),
+            Duration::from_secs(2),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        let err = c.post(c.url(&["events"]), None).await.unwrap_err();
+        assert!(err.outcome_unknown);
+        let text = err.to_string();
+        assert!(text.contains("didn't respond within 0.2s"), "{text}");
+        assert!(text.ends_with("may or may not have taken effect"), "{text}");
+    }
+
+    async fn respond(template: ResponseTemplate) -> ApiError {
+        let server = MockServer::start().await;
+        Mock::given(path("/campaigns"))
+            .respond_with(template)
+            .mount(&server)
+            .await;
+        let c = client(&server.uri());
+        c.get(c.url(&["campaigns"])).await.unwrap_err()
+    }
+
+    #[tokio::test]
+    async fn unreadable_success_bodies_are_errors_with_unknown_outcome() {
+        let cases = [
+            ("an empty body", ResponseTemplate::new(200)),
+            (
+                "an empty body",
+                ResponseTemplate::new(202).set_body_string(" \n"),
+            ),
+            (
+                "invalid JSON",
+                ResponseTemplate::new(200).set_body_raw("{\"campaigns\": [", "application/json"),
+            ),
+            (
+                "an HTML page instead of JSON",
+                ResponseTemplate::new(200)
+                    .set_body_raw("<!DOCTYPE html><html>hi</html>", "text/html"),
+            ),
+        ];
+        for (expected, template) in cases {
+            let err = respond(template).await;
+            assert!(err.message.contains(expected), "{expected}: {err}");
+            assert!(err.outcome_unknown, "{expected}");
+        }
+    }
+
+    #[tokio::test]
+    async fn html_error_pages_are_summarized_not_passed_through() {
+        let page = format!(
+            "<!DOCTYPE html><html lang=\"en\">{}</html>",
+            "<div>x</div>".repeat(500)
+        );
+        let err = respond(
+            ResponseTemplate::new(404).set_body_raw(page.clone(), "text/html; charset=utf-8"),
+        )
+        .await;
+        let text = err.to_string();
+        assert!(
+            text.starts_with("Oshi API returned 404 Not Found with an HTML page"),
+            "{text}"
+        );
+        assert!(!text.contains('<'), "{text}");
+        assert!(!err.outcome_unknown);
+
+        // Sniffed even without a content type; a 5xx page leaves the outcome unknown.
+        let err = respond(ResponseTemplate::new(502).set_body_string(page)).await;
+        assert!(
+            err.to_string().contains("HTML page") && err.outcome_unknown,
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_error_body_gives_a_clean_message() {
+        let err = respond(ResponseTemplate::new(405)).await;
+        assert_eq!(err.to_string(), "Oshi API returned 405 Method Not Allowed");
     }
 }

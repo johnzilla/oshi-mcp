@@ -112,6 +112,7 @@ The Shopify purchase-verification endpoints aren't covered yet.
 - **Strict inputs.** Ids are percent-encoded per path segment, so a crafted `user_id` like `x/../../events/<id>/void` can't reach a different endpoint. UUIDs, lengths and ranges are checked locally, and unknown arguments are rejected instead of dropped.
 - **The key stays in one place.** It's read from `OSHI_API_KEY`, sent only as a bearer header to `https://app.oshi.tech`, never logged, and redacted from debug output. Redirects aren't followed. The API base URL is compiled in, with no override.
 - **Hints for your client.** Each tool carries MCP annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`), so clients that have their own permission prompts can use them too.
+- **Honest errors.** Oshi's error message and field errors reach the agent as they are; HTML error pages are summarized rather than dumped into its context. When a request may have taken effect but the result is unknown (a timeout, a 5xx, an unreadable reply), the error says so, and a failed grant tells the agent to check or retry with the *same* `external_id`, never a new one.
 - **Treat results as untrusted.** They contain strings that you and your users wrote, such as campaign names and metadata. The server's instructions tell the agent to treat them as data, not instructions.
 
 Oshi's own safeguards still apply: rewards are held 30–90 days and can be voided during the hold, and only bitcoin-loaded sats can fund them.
@@ -126,6 +127,8 @@ Oshi's own safeguards still apply: rewards are held 30–90 days and can be void
 cargo test      # unit tests plus end-to-end MCP tests against a mocked Oshi API
 cargo clippy --all-targets -- -D warnings
 ```
+
+`tests/errors.rs` replays error responses recorded from the live API (including ones the spec doesn't list, like its HTML 404 page and a 308 redirect), plus network failures and approval-step failures.
 
 To release, bump `version` in `Cargo.toml`, commit to `main`, then tag and push (`git tag -a v0.1.1 -m v0.1.1 && git push origin v0.1.1`). The workflow refuses tags that aren't on `main` or don't match the version, and reruns the full CI suite before building. It builds macOS, Linux (static musl) and Windows binaries, then creates a **draft** release with `SHA256SUMS` and attestations. Publish that draft rather than creating a release by hand. Then run `cargo publish --locked`.
 
