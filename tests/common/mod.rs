@@ -7,6 +7,7 @@ use std::{
 };
 
 use oshi_mcp::{
+    audit::AuditSink,
     client::OshiClient,
     config::{ApiKey, parse_enabled_tools},
     server::OshiServer,
@@ -50,10 +51,50 @@ pub async fn serve<C: ClientHandler>(
     confirm_calls: bool,
     client_handler: C,
 ) -> RunningService<RoleClient, C> {
-    let server = OshiServer::new(client, &parse_enabled_tools(enable).unwrap(), confirm_calls);
+    serve_audited(client, enable, confirm_calls, client_handler)
+        .await
+        .0
+}
+
+/// Like `serve`, also returning the server's audit records as they're written.
+pub async fn serve_audited<C: ClientHandler>(
+    client: OshiClient,
+    enable: &str,
+    confirm_calls: bool,
+    client_handler: C,
+) -> (RunningService<RoleClient, C>, AuditLog) {
+    let (sink, lines) = AuditSink::memory();
+    let server = OshiServer::new(client, &parse_enabled_tools(enable).unwrap(), confirm_calls)
+        .with_audit_sink(sink);
     let (server_io, client_io) = tokio::io::duplex(64 * 1024);
     tokio::spawn(async move { server.serve(server_io).await.unwrap().waiting().await });
-    client_handler.serve(client_io).await.unwrap()
+    (
+        client_handler.serve(client_io).await.unwrap(),
+        AuditLog(lines),
+    )
+}
+
+pub async fn connect_audited<C: ClientHandler>(
+    enable: &str,
+    confirm_calls: bool,
+    client_handler: C,
+) -> (MockServer, RunningService<RoleClient, C>, AuditLog) {
+    let mock = MockServer::start().await;
+    let client = OshiClient::new(&ApiKey::new("test_key").unwrap(), &mock.uri()).unwrap();
+    let (peer, audit) = serve_audited(client, enable, confirm_calls, client_handler).await;
+    (mock, peer, audit)
+}
+
+pub struct AuditLog(Arc<Mutex<Vec<String>>>);
+
+impl AuditLog {
+    pub fn records(&self) -> Vec<Value> {
+        let lines = self.0.lock().unwrap();
+        lines
+            .iter()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
 }
 
 pub fn args(v: Value) -> JsonObject {

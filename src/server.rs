@@ -14,6 +14,7 @@ use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
 use crate::{
+    audit::{self, AuditSink},
     client::{ApiError, OshiClient},
     config::GATED_TOOLS,
     confirm::{self, show, show_known, show_str},
@@ -33,6 +34,7 @@ pub struct OshiServer {
     tool_router: ToolRouter<Self>,
     portal_links_enabled: bool,
     confirm_calls: bool,
+    audit: AuditSink,
     instructions: String,
 }
 
@@ -75,9 +77,16 @@ impl OshiServer {
             client,
             portal_links_enabled: enabled.contains("mint_portal_link"),
             confirm_calls,
+            audit: AuditSink::Stderr,
             tool_router,
             instructions,
         }
+    }
+
+    /// Sends audit records somewhere other than stderr (used by tests).
+    pub fn with_audit_sink(mut self, sink: AuditSink) -> Self {
+        self.audit = sink;
+        self
     }
 
     pub fn tool_names(&self) -> Vec<String> {
@@ -118,21 +127,6 @@ impl OshiServer {
             .await
             .map_err(|e| self.api_error(e))?;
         Ok(self.scrub(v))
-    }
-
-    /// Gets the user's approval for a gated call, unless the operator turned
-    /// confirmation off. `prompt` is only awaited once the client is known to
-    /// support approval prompts.
-    async fn approve(
-        &self,
-        peer: Option<&Peer<RoleServer>>,
-        prompt: impl Future<Output = Result<String, String>>,
-    ) -> Result<(), String> {
-        if !self.confirm_calls {
-            return Ok(());
-        }
-        let peer = confirm::require_support(peer)?;
-        confirm::ask(peer, prompt.await?).await
     }
 }
 
@@ -366,7 +360,7 @@ impl OshiServer {
         read_only_hint = false,
         destructive_hint = false,
         idempotent_hint = true,
-        open_world_hint = false
+        open_world_hint = true
     ))]
     async fn grant_reward(
         &self,
@@ -377,7 +371,7 @@ impl OshiServer {
     }
 
     /// Fetch one reward event (status, amount, timestamps) by its reward_event_id.
-    #[tool(annotations(title = "Get reward", read_only_hint = true, open_world_hint = false))]
+    #[tool(annotations(title = "Get reward", read_only_hint = true, open_world_hint = true))]
     async fn get_reward(
         &self,
         Parameters(p): Parameters<RewardEventParams>,
@@ -391,7 +385,7 @@ impl OshiServer {
     #[tool(annotations(
         title = "Look up rewards",
         read_only_hint = true,
-        open_world_hint = false
+        open_world_hint = true
     ))]
     async fn lookup_reward(
         &self,
@@ -416,7 +410,7 @@ impl OshiServer {
         read_only_hint = false,
         destructive_hint = true,
         idempotent_hint = true,
-        open_world_hint = false
+        open_world_hint = true
     ))]
     async fn void_reward(
         &self,
@@ -431,14 +425,14 @@ impl OshiServer {
     #[tool(annotations(
         title = "List campaigns",
         read_only_hint = true,
-        open_world_hint = false
+        open_world_hint = true
     ))]
     async fn list_campaigns(&self) -> Result<String, String> {
         self.finish(self.client.get(self.client.url(&["campaigns"])).await)
     }
 
     /// Get one campaign by its campaign_id.
-    #[tool(annotations(title = "Get campaign", read_only_hint = true, open_world_hint = false))]
+    #[tool(annotations(title = "Get campaign", read_only_hint = true, open_world_hint = true))]
     async fn get_campaign(
         &self,
         Parameters(p): Parameters<CampaignParams>,
@@ -455,7 +449,7 @@ impl OshiServer {
         read_only_hint = false,
         destructive_hint = true,
         idempotent_hint = true,
-        open_world_hint = false
+        open_world_hint = true
     ))]
     async fn update_campaign(
         &self,
@@ -472,7 +466,7 @@ impl OshiServer {
         read_only_hint = false,
         destructive_hint = false,
         idempotent_hint = false,
-        open_world_hint = false
+        open_world_hint = true
     ))]
     async fn mint_portal_link(
         &self,
@@ -484,7 +478,7 @@ impl OshiServer {
 
     /// Get a rewarded user's profile, wallet balance, total rewarded, and their 100 most recent
     /// rewards and withdrawals. Only works once the user has received a reward.
-    #[tool(annotations(title = "Get user", read_only_hint = true, open_world_hint = false))]
+    #[tool(annotations(title = "Get user", read_only_hint = true, open_world_hint = true))]
     async fn get_user(&self, Parameters(p): Parameters<UserParams>) -> Result<String, String> {
         let user_id = path_identifier("user_id", &p.user_id)?;
         self.finish(self.client.get(self.client.url(&["users", &user_id])).await)
@@ -494,6 +488,10 @@ impl OshiServer {
 // ---- Gated tool bodies -----------------------------------------------------
 //
 // Split from the #[tool] wrappers so tests can run them without a live peer.
+// Each one writes an audit record, whatever happens.
+
+/// Facts learned while building an approval prompt, kept for the audit record.
+type Facts = Vec<(&'static str, Value)>;
 
 impl OshiServer {
     async fn grant(
@@ -501,13 +499,101 @@ impl OshiServer {
         p: GrantRewardParams,
         peer: Option<&Peer<RoleServer>>,
     ) -> Result<String, String> {
+        let mut entry = audit::Entry::new("grant_reward");
+        let result = self.grant_inner(p, peer, &mut entry).await;
+        entry.finish(&self.audit, &result);
+        result
+    }
+
+    async fn void(
+        &self,
+        p: RewardEventParams,
+        peer: Option<&Peer<RoleServer>>,
+    ) -> Result<String, String> {
+        let mut entry = audit::Entry::new("void_reward");
+        let result = self.void_inner(p, peer, &mut entry).await;
+        entry.finish(&self.audit, &result);
+        result
+    }
+
+    async fn update(
+        &self,
+        p: UpdateCampaignParams,
+        peer: Option<&Peer<RoleServer>>,
+    ) -> Result<String, String> {
+        let mut entry = audit::Entry::new("update_campaign");
+        let result = self.update_inner(p, peer, &mut entry).await;
+        entry.finish(&self.audit, &result);
+        result
+    }
+
+    async fn mint(&self, p: UserParams, peer: Option<&Peer<RoleServer>>) -> Result<String, String> {
+        let mut entry = audit::Entry::new("mint_portal_link");
+        let result = self.mint_inner(p, peer, &mut entry).await;
+        entry.finish(&self.audit, &result);
+        result
+    }
+
+    /// Gets the user's approval for a gated call, unless the operator turned
+    /// confirmation off. `prompt` is only awaited once the client is known to
+    /// support approval prompts; the facts it returns go into the audit record.
+    async fn approve(
+        &self,
+        peer: Option<&Peer<RoleServer>>,
+        entry: &mut audit::Entry,
+        prompt: impl Future<Output = Result<(String, Facts), String>>,
+    ) -> Result<(), String> {
+        entry.stage(audit::Stage::Approving);
+        if self.confirm_calls {
+            let peer = confirm::require_support(peer)?;
+            let (text, facts) = prompt.await?;
+            for (key, value) in facts {
+                entry.set(key, value);
+            }
+            confirm::ask(peer, text).await?;
+            entry.approval("approved");
+        } else {
+            entry.approval("not_required");
+        }
+        entry.stage(audit::Stage::Sending);
+        Ok(())
+    }
+
+    /// Maps a gated call's API result, noting in the audit record when the
+    /// outcome is unknown.
+    fn sent(
+        &self,
+        entry: &mut audit::Entry,
+        result: Result<Value, ApiError>,
+    ) -> Result<Value, (String, bool)> {
+        result.map_err(|e| {
+            let unknown = e.outcome_unknown;
+            if unknown {
+                entry.outcome_unknown();
+            }
+            (self.api_error(e), unknown)
+        })
+    }
+
+    async fn grant_inner(
+        &self,
+        p: GrantRewardParams,
+        peer: Option<&Peer<RoleServer>>,
+        entry: &mut audit::Entry,
+    ) -> Result<String, String> {
+        let campaign_id = p.rewards_campaign_id.to_string();
+        entry.set("campaign_id", campaign_id.as_str());
+        // Identifiers are logged once validated, so bad input can't bloat the log.
         let mut body = json!({
             "rewards_campaign_id": p.rewards_campaign_id,
             "user_id": identifier("user_id", &p.user_id)?,
             "external_id": identifier("external_id", &p.external_id)?,
         });
+        entry.copy("user_id", &body, "user_id");
+        entry.copy("external_id", &body, "external_id");
         if let Some(addr) = &p.lightning_address {
             body["lightning_address"] = lightning_address(addr)?.into();
+            entry.copy("lightning_address", &body, "lightning_address");
         }
         if let Some(meta) = p.metadata {
             let meta = Value::Object(meta);
@@ -519,11 +605,10 @@ impl OshiServer {
             body["metadata"] = meta;
         }
 
-        let campaign_id = p.rewards_campaign_id.to_string();
         let user_id = body["user_id"].as_str().unwrap_or_default().to_owned();
         let external_id = body["external_id"].as_str().unwrap_or_default().to_owned();
         let lightning = body["lightning_address"].as_str().map(str::to_owned);
-        self.approve(peer, async {
+        self.approve(peer, entry, async {
             let c = self.fetch(&["campaigns", &campaign_id]).await?;
             let c = &c["campaign"];
             let mut prompt = format!(
@@ -541,22 +626,33 @@ impl OshiServer {
                  never pays twice.",
                 show_known(&c["holding_period_days"])
             ));
-            Ok(prompt)
+            let facts = vec![
+                ("campaign_name", c["name"].clone()),
+                ("sats", c["fixed_reward_sats"].clone()),
+            ];
+            Ok((prompt, facts))
         })
         .await?;
 
         let resp = self
-            .client
-            .post(self.client.url(&["events"]), Some(&body))
-            .await
-            .map_err(|e| {
-                let unknown = e.outcome_unknown;
-                let mut msg = self.api_error(e);
+            .sent(
+                entry,
+                self.client
+                    .post(self.client.url(&["events"]), Some(&body))
+                    .await,
+            )
+            .map_err(|(mut msg, unknown)| {
                 if unknown {
                     msg.push_str(GRANT_RETRY_HINT);
                 }
                 msg
             })?;
+        entry.copy("reward_event_id", &resp, "reward_event_id");
+        entry.copy("status", &resp, "status");
+        entry.copy("sats", &resp, "sats_amount");
+        entry.copy("issuance_fee_sats", &resp, "issuance_fee_sats");
+        entry.copy("api_message", &resp, "message");
+
         let resp = self.scrub(resp);
         if resp.get("status").and_then(Value::as_str) == Some("insufficient_funds") {
             return Ok(format!(
@@ -568,68 +664,116 @@ impl OshiServer {
         Ok(pretty(&resp))
     }
 
-    async fn void(
+    async fn void_inner(
         &self,
         p: RewardEventParams,
         peer: Option<&Peer<RoleServer>>,
+        entry: &mut audit::Entry,
     ) -> Result<String, String> {
         let id = p.reward_event_id.to_string();
-        self.approve(peer, async {
+        entry.set("reward_event_id", id.as_str());
+        self.approve(peer, entry, async {
             let e = self.fetch(&["events", &id]).await?;
             let e = &e["event"];
-            Ok(format!(
+            let prompt = format!(
                 "Approve voiding reward {id}: {} sats to user {} from campaign {} (status {})?\n\
                  This can't be undone, and the issuance fee isn't refunded.",
                 show_known(&e["sats_amount"]),
                 show_known(&e["external_user_id"]),
                 show_known(&e["campaign_name"]),
                 show_known(&e["status"]),
-            ))
+            );
+            let facts = vec![
+                ("sats", e["sats_amount"].clone()),
+                ("user_id", e["external_user_id"].clone()),
+                ("campaign_id", e["campaign_id"].clone()),
+                ("campaign_name", e["campaign_name"].clone()),
+                ("status_before", e["status"].clone()),
+            ];
+            Ok((prompt, facts))
         })
         .await?;
+
         let url = self.client.url(&["events", &id, "void"]);
-        self.finish(self.client.post(url, None).await)
+        let resp = self
+            .sent(entry, self.client.post(url, None).await)
+            .map_err(|(msg, _)| msg)?;
+        entry.copy("status", &resp, "status");
+        entry.copy("sats", &resp, "sats_amount");
+        entry.copy("user_id", &resp, "external_user_id");
+        entry.copy("voided_at", &resp, "voided_at");
+        entry.copy("api_message", &resp, "message");
+        Ok(pretty(&self.scrub(resp)))
     }
 
-    async fn update(
+    async fn update_inner(
         &self,
         p: UpdateCampaignParams,
         peer: Option<&Peer<RoleServer>>,
+        entry: &mut audit::Entry,
     ) -> Result<String, String> {
+        let id = p.campaign_id.to_string();
+        entry.set("campaign_id", id.as_str());
         p.validate()?;
         let body = serde_json::to_value(&p).map_err(|e| e.to_string())?;
-        let id = p.campaign_id.to_string();
-        self.approve(peer, async {
+        entry.set("changes", body.clone());
+        self.approve(peer, entry, async {
             let c = self.fetch(&["campaigns", &id]).await?;
             let c = &c["campaign"];
-            let changes: String = body
-                .as_object()
-                .into_iter()
-                .flatten()
+            let fields = body.as_object().into_iter().flatten();
+            let changes: String = fields
+                .clone()
                 .map(|(field, new)| format!("\n  {field}: {} -> {}", show(&c[field]), show(new)))
                 .collect();
-            Ok(format!(
+            let before: Map<String, Value> = fields
+                .map(|(field, _)| (field.clone(), c[field].clone()))
+                .collect();
+            let prompt = format!(
                 "Approve these changes to campaign {}?{changes}",
                 show_known(&c["name"])
+            );
+            Ok((
+                prompt,
+                vec![
+                    ("campaign_name", c["name"].clone()),
+                    ("before", before.into()),
+                ],
             ))
         })
         .await?;
+
         let url = self.client.url(&["campaigns", &id]);
-        self.finish(self.client.patch(url, &body).await)
+        let resp = self
+            .sent(entry, self.client.patch(url, &body).await)
+            .map_err(|(msg, _)| msg)?;
+        Ok(pretty(&self.scrub(resp)))
     }
 
-    async fn mint(&self, p: UserParams, peer: Option<&Peer<RoleServer>>) -> Result<String, String> {
+    async fn mint_inner(
+        &self,
+        p: UserParams,
+        peer: Option<&Peer<RoleServer>>,
+        entry: &mut audit::Entry,
+    ) -> Result<String, String> {
         let user_id = path_identifier("user_id", &p.user_id)?;
-        self.approve(peer, async {
-            Ok(format!(
+        entry.set("user_id", user_id.as_str());
+        self.approve(peer, entry, async {
+            let prompt = format!(
                 "Approve minting a 24-hour sign-in link to the rewards wallet of user {}?\n\
                  Anyone who opens it can withdraw that user's released sats.",
                 show_str(&user_id)
-            ))
+            );
+            Ok((prompt, Facts::new()))
         })
         .await?;
+
         let url = self.client.url(&["users", &user_id, "portal-link"]);
-        self.finish(self.client.post(url, None).await)
+        let resp = self
+            .sent(entry, self.client.post(url, None).await)
+            .map_err(|(msg, _)| msg)?;
+        // The link itself is a credential and is never logged.
+        entry.copy("expires_at", &resp, "expires_at");
+        Ok(pretty(&self.scrub(resp)))
     }
 }
 
@@ -649,19 +793,36 @@ impl ServerHandler for OshiServer {
 mod tests {
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
-        matchers::{body_json, method, path, query_param},
+        matchers::{any, body_json, method, path, query_param},
     };
+
+    use std::sync::{Arc, Mutex};
 
     use super::*;
     use crate::config::{ApiKey, parse_enabled_tools};
 
     async fn setup(enable: &str) -> (MockServer, OshiServer) {
+        let (mock, server, _audit) = setup_audited(enable).await;
+        (mock, server)
+    }
+
+    /// Like `setup`, also returning the audit lines the server writes.
+    async fn setup_audited(enable: &str) -> (MockServer, OshiServer, Arc<Mutex<Vec<String>>>) {
         let mock = MockServer::start().await;
         let client = OshiClient::new(&ApiKey::new("test_key").unwrap(), &mock.uri()).unwrap();
-        (
-            mock,
-            OshiServer::new(client, &parse_enabled_tools(enable).unwrap(), false),
-        )
+        let (sink, lines) = AuditSink::memory();
+        let server = OshiServer::new(client, &parse_enabled_tools(enable).unwrap(), false)
+            .with_audit_sink(sink);
+        (mock, server, lines)
+    }
+
+    fn audit_records(lines: &Mutex<Vec<String>>) -> Vec<Value> {
+        lines
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
     }
 
     const CAMPAIGN: &str = "72cb8983-f65a-4103-abf7-382c993d0abe";
@@ -718,6 +879,13 @@ mod tests {
             assert!(
                 a.read_only_hint.is_some(),
                 "{} lacks read_only_hint",
+                tool.name
+            );
+            // Every tool calls Oshi, and grants pay out to outside wallets.
+            assert_eq!(
+                a.open_world_hint,
+                Some(true),
+                "{} must declare open_world_hint",
                 tool.name
             );
             let schema = serde_json::to_value(&*tool.input_schema).unwrap();
@@ -891,5 +1059,156 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    // ---- Audit records --------------------------------------------------------
+
+    const LINK_TOKEN: &str = "Qm9ndXNUb2tlbkV4YW1wbGVPbmx5RG9Ob3RVc2U";
+
+    #[tokio::test]
+    async fn successful_grant_is_audited_without_portal_links() {
+        let (mock, server, lines) = setup_audited("grant_reward").await;
+        Mock::given(method("POST"))
+            .and(path("/events"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({
+                "message": "Reward accepted.",
+                "reward_event_id": "7f0a1b2c-3d4e-5f60-7182-93a4b5c6d7e8",
+                "status": "pending",
+                "sats_amount": 100,
+                "issuance_fee_sats": 2,
+                "portal_url": format!("https://portal.bitcoinrewards.app/a/{LINK_TOKEN}"),
+            })))
+            .mount(&mock)
+            .await;
+        server.grant(grant("  user_123"), None).await.unwrap();
+
+        let records = audit_records(&lines);
+        assert_eq!(records.len(), 1);
+        let r = &records[0];
+        assert_eq!(r["tool"], "grant_reward");
+        assert_eq!(r["outcome"], "ok");
+        assert_eq!(r["approval"], "not_required");
+        assert_eq!(r["campaign_id"], CAMPAIGN);
+        assert_eq!(r["user_id"], "user_123");
+        assert_eq!(r["external_id"], "action_456");
+        assert_eq!(r["reward_event_id"], "7f0a1b2c-3d4e-5f60-7182-93a4b5c6d7e8");
+        assert_eq!(r["status"], "pending");
+        assert_eq!(r["sats"], 100);
+        assert_eq!(r["issuance_fee_sats"], 2);
+        assert_eq!(r["api_message"], "Reward accepted.");
+        assert!(r["ts"].as_str().unwrap().ends_with('Z'));
+        assert!(!r.to_string().contains(LINK_TOKEN), "{r}");
+    }
+
+    #[tokio::test]
+    async fn failed_and_rejected_grants_are_audited() {
+        let (mock, server, lines) = setup_audited("grant_reward").await;
+        Mock::given(path("/events"))
+            .respond_with(ResponseTemplate::new(422).set_body_json(json!({
+                "message": "Bitcoin funding exceeded.", "error": "bitcoin_funding_exceeded",
+            })))
+            .mount(&mock)
+            .await;
+        server.grant(grant(""), None).await.unwrap_err();
+        server.grant(grant("u"), None).await.unwrap_err();
+
+        let records = audit_records(&lines);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["outcome"], "invalid_input");
+        assert!(
+            records[0].get("user_id").is_none(),
+            "invalid ids aren't logged"
+        );
+        assert_eq!(records[1]["outcome"], "failed");
+        let error = records[1]["error"].as_str().unwrap();
+        assert!(
+            error.contains("422") && error.contains("bitcoin_funding_exceeded"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn timed_out_grant_is_audited_as_outcome_unknown() {
+        let mock = MockServer::start().await;
+        Mock::given(path("/events"))
+            .respond_with(ResponseTemplate::new(202).set_delay(std::time::Duration::from_secs(2)))
+            .mount(&mock)
+            .await;
+        let client = OshiClient::with_timeouts(
+            &ApiKey::new("k").unwrap(),
+            &mock.uri(),
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_millis(200),
+        )
+        .unwrap();
+        let (sink, lines) = AuditSink::memory();
+        let server = OshiServer::new(client, &parse_enabled_tools("grant_reward").unwrap(), false)
+            .with_audit_sink(sink);
+        server.grant(grant("u"), None).await.unwrap_err();
+        assert_eq!(audit_records(&lines)[0]["outcome"], "outcome_unknown");
+    }
+
+    #[tokio::test]
+    async fn portal_links_are_never_logged_even_when_enabled() {
+        let (mock, server, lines) = setup_audited("mint_portal_link").await;
+        Mock::given(path("/users/user_123/portal-link"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "portal_url": format!("https://portal.bitcoinrewards.app/a/{LINK_TOKEN}"),
+                "expires_at": "2026-10-19T14:00:00.000Z",
+            })))
+            .mount(&mock)
+            .await;
+        let out = server
+            .mint(
+                UserParams {
+                    user_id: "user_123".into(),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.contains(LINK_TOKEN),
+            "the operator opted in, so the agent gets the link"
+        );
+        let r = &audit_records(&lines)[0];
+        assert_eq!(r["tool"], "mint_portal_link");
+        assert_eq!(r["user_id"], "user_123");
+        assert_eq!(r["expires_at"], "2026-10-19T14:00:00.000Z");
+        assert!(!r.to_string().contains(LINK_TOKEN), "{r}");
+    }
+
+    #[tokio::test]
+    async fn void_and_update_are_audited_and_reads_are_not() {
+        let (mock, server, lines) = setup_audited("void_reward,update_campaign").await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "status": "voided", "sats_amount": 100, "voided_at": "2026-10-18T18:00:00.000Z",
+            })))
+            .mount(&mock)
+            .await;
+        let event: Uuid = "7f0a1b2c-3d4e-5f60-7182-93a4b5c6d7e8".parse().unwrap();
+        server
+            .void(
+                RewardEventParams {
+                    reward_event_id: event,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let update: UpdateCampaignParams =
+            serde_json::from_value(json!({"campaign_id": CAMPAIGN, "fixed_reward_sats": 250}))
+                .unwrap();
+        server.update(update, None).await.unwrap();
+        server.list_campaigns().await.unwrap();
+
+        let records = audit_records(&lines);
+        assert_eq!(records.len(), 2, "reads aren't audited: {records:#?}");
+        assert_eq!(records[0]["tool"], "void_reward");
+        assert_eq!(records[0]["reward_event_id"], event.to_string());
+        assert_eq!(records[0]["status"], "voided");
+        assert_eq!(records[1]["tool"], "update_campaign");
+        assert_eq!(records[1]["changes"], json!({"fixed_reward_sats": 250}));
     }
 }

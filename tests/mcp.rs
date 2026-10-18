@@ -330,3 +330,73 @@ async fn every_gated_tool_asks_with_escaped_details() {
     );
     peer.cancel().await.unwrap();
 }
+
+// ---- Audit records for approved and refused calls --------------------------------
+
+#[tokio::test]
+async fn audit_records_approval_and_what_was_approved() {
+    let (mock, peer, audit) = connect_audited(
+        "grant_reward,update_campaign",
+        true,
+        Approver::new(Answer::Approve),
+    )
+    .await;
+    mount_campaign(&mock).await;
+    Mock::given(method("POST"))
+        .and(path("/events"))
+        .respond_with(ResponseTemplate::new(202).set_body_json(json!({"status": "pending"})))
+        .mount(&mock)
+        .await;
+    Mock::given(method("PATCH"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"campaign": {}})))
+        .mount(&mock)
+        .await;
+    let (is_error, text) = call(&peer, "grant_reward", grant_args()).await;
+    assert!(!is_error, "{text}");
+    let (is_error, text) = call(
+        &peer,
+        "update_campaign",
+        json!({"campaign_id": CAMPAIGN, "fixed_reward_sats": 250}),
+    )
+    .await;
+    assert!(!is_error, "{text}");
+
+    let records = audit.records();
+    assert_eq!(records.len(), 2);
+    let grant = &records[0];
+    assert_eq!(grant["approval"], "approved");
+    assert_eq!(grant["outcome"], "ok");
+    assert_eq!(grant["campaign_name"], "App Referral");
+    assert_eq!(
+        grant["sats"], 100,
+        "amount from the campaign the user approved"
+    );
+    assert_eq!(grant["lightning_address"], "satoshi@wallet.example");
+    let update = &records[1];
+    assert_eq!(update["changes"], json!({"fixed_reward_sats": 250}));
+    assert_eq!(update["before"], json!({"fixed_reward_sats": 100}));
+    peer.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn audit_records_refusals() {
+    let (mock, peer, audit) =
+        connect_audited("grant_reward", true, Approver::new(Answer::Decline)).await;
+    mount_campaign(&mock).await;
+    call(&peer, "grant_reward", grant_args()).await;
+    peer.cancel().await.unwrap();
+
+    let (_mock, peer, unsupported) = connect_audited("grant_reward", true, ()).await;
+    call(&peer, "grant_reward", grant_args()).await;
+    peer.cancel().await.unwrap();
+
+    for (r, reason) in [
+        (&audit.records()[0], "did not approve"),
+        (&unsupported.records()[0], "can't show approval prompts"),
+    ] {
+        assert_eq!(r["outcome"], "not_approved", "{r}");
+        assert_eq!(r["approval"], "not_given", "{r}");
+        assert!(r["error"].as_str().unwrap().contains(reason), "{r}");
+        assert_eq!(r["user_id"], "user_123");
+    }
+}
