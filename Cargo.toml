@@ -1,0 +1,40 @@
+[package]
+name = "oshi-mcp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Read-only-by-default MCP server for Oshi API Rewards (Bitcoin rewards for any app)"
+license = "MIT"
+repository = "https://github.com/johnzilla/oshi-mcp"
+readme = "README.md"
+keywords = ["mcp", "bitcoin", "lightning", "rewards", "oshi"]
+categories = ["command-line-utilities", "api-bindings"]
+exclude = [".github/", "skills/"]
+
+[dependencies]
+anyhow = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rmcp = { version = "3.5", default-features = false, features = ["server", "macros", "transport-io"] }
+schemars = { version = "1", features = ["uuid1"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std"] }
+url = "2"
+uuid = { version = "1", features = ["serde"] }
+
+[dev-dependencies]
+rmcp = { version = "3.5", default-features = false, features = ["client", "server", "macros"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util"] }
+wiremock = "0.6"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+opt-level = "z"
+panic = "abort"
+
+# Lets `cargo binstall oshi-mcp` fetch the prebuilt release binary instead of compiling.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }{ binary-ext }"
+pkg-fmt = "bin"
