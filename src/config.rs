@@ -44,6 +44,8 @@ pub struct Config {
     pub api_key: ApiKey,
     /// Gated tools the operator opted into.
     pub enabled_tools: BTreeSet<String>,
+    /// Whether gated tools ask the user to approve each call (on by default).
+    pub confirm_calls: bool,
 }
 
 impl Config {
@@ -56,10 +58,26 @@ impl Config {
             Err(env::VarError::NotPresent) => BTreeSet::new(),
             Err(e) => bail!("OSHI_MCP_ENABLE_TOOLS: {e}"),
         };
+        let confirm_calls = match env::var("OSHI_MCP_CONFIRM") {
+            Ok(raw) => parse_confirm(&raw)?,
+            Err(env::VarError::NotPresent) => true,
+            Err(e) => bail!("OSHI_MCP_CONFIRM: {e}"),
+        };
         Ok(Self {
             api_key,
             enabled_tools,
+            confirm_calls,
         })
+    }
+}
+
+/// Parses `OSHI_MCP_CONFIRM`. Only an explicit `off` turns confirmation off;
+/// anything unrecognized is an error rather than a silent default.
+pub fn parse_confirm(raw: &str) -> Result<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "on" => Ok(true),
+        "off" => Ok(false),
+        other => bail!("OSHI_MCP_CONFIRM must be \"on\" or \"off\", not {other:?}"),
     }
 }
 
@@ -102,6 +120,16 @@ mod tests {
             parse_enabled_tools("get_user").is_err(),
             "read tools are always on, not gated"
         );
+    }
+
+    #[test]
+    fn confirm_is_on_unless_explicitly_off() {
+        assert!(parse_confirm("").unwrap());
+        assert!(parse_confirm("on").unwrap());
+        assert!(!parse_confirm(" OFF ").unwrap());
+        for bad in ["false", "0", "no", "of"] {
+            assert!(parse_confirm(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

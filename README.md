@@ -83,15 +83,35 @@ To turn on any of the tools marked off, list them in `OSHI_MCP_ENABLE_TOOLS`:
 
 Unknown names stop the server from starting, so a typo can't silently change what's exposed. There's no `all` shortcut.
 
+### Approving each call
+
+Enabled tools that are off by default also ask you to approve **every call**, in your MCP client's own UI (MCP elicitation). The server writes the prompt from validated arguments and Oshi's data, not from anything the agent wrote:
+
+```
+Approve paying 100 sats from campaign "App Referral" to user "user_123" for action "action_456"?
+Held for 30 days, and can be voided until then. Reusing an action id never pays twice.
+```
+
+Nothing is sent to Oshi unless you tick **approve** and accept. Declining, cancelling and waiting 5 minutes all count as no. If your client can't show these prompts, those tools refuse to run, and the error tells the agent why.
+
+For unattended use, or a client without elicitation support, turn approval off on purpose:
+
+```json
+"OSHI_MCP_CONFIRM": "off"
+```
+
+Any value other than `on` or `off` stops the server from starting.
+
 The Shopify purchase-verification endpoints aren't covered yet.
 
 ## Security model
 
 - **Least privilege by default.** Tools you haven't enabled are left out of the tool list entirely, and calls to them are refused. The server tells the agent to ask you rather than work around it.
+- **A human approves every write.** Enabled tools that spend sats, change campaigns or mint portal links pause for your approval on each call, and refuse to run if they can't ask. Values from Oshi in the prompt (like campaign names) are quoted and escaped, so they can't pass themselves off as part of the prompt.
 - **Portal links are credentials.** A portal link signs whoever opens it into the user's wallet. Unless `mint_portal_link` is enabled, every tool result and API error is scanned at any depth: portal-link fields and anything shaped like a portal link are redacted, wherever they appear.
 - **Strict inputs.** Ids are percent-encoded per path segment, so a crafted `user_id` like `x/../../events/<id>/void` can't reach a different endpoint. UUIDs, lengths and ranges are checked locally, and unknown arguments are rejected instead of dropped.
 - **The key stays in one place.** It's read from `OSHI_API_KEY`, sent only as a bearer header to `https://app.oshi.tech`, never logged, and redacted from debug output. Redirects aren't followed. The API base URL is compiled in, with no override.
-- **Hints for your client.** Each tool carries MCP annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`), so clients can ask before write actions.
+- **Hints for your client.** Each tool carries MCP annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`), so clients that have their own permission prompts can use them too.
 - **Treat results as untrusted.** They contain strings that you and your users wrote, such as campaign names and metadata. The server's instructions tell the agent to treat them as data, not instructions.
 
 Oshi's own safeguards still apply: rewards are held 30–90 days and can be voided during the hold, and only bitcoin-loaded sats can fund them.

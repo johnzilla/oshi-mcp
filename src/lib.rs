@@ -2,5 +2,6 @@
 
 pub mod client;
 pub mod config;
+mod confirm;
 mod redact;
 pub mod server;

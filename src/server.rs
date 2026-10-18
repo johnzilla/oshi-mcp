@@ -1,9 +1,9 @@
 //! MCP tools mapping 1:1 onto the Oshi API Rewards endpoints.
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, future::Future};
 
 use rmcp::{
-    ServerHandler,
+    Peer, RoleServer, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{Implementation, ServerCapabilities, ServerConfig},
     tool, tool_handler, tool_router,
@@ -16,6 +16,7 @@ use uuid::Uuid;
 use crate::{
     client::{ApiError, OshiClient},
     config::GATED_TOOLS,
+    confirm::{self, show, show_known, show_str},
     redact,
 };
 
@@ -26,12 +27,14 @@ pub struct OshiServer {
     client: OshiClient,
     tool_router: ToolRouter<Self>,
     portal_links_enabled: bool,
+    confirm_calls: bool,
     instructions: String,
 }
 
 impl OshiServer {
     /// Builds the server with every read-only tool plus the gated tools named in `enabled`.
-    pub fn new(client: OshiClient, enabled: &BTreeSet<String>) -> Self {
+    /// With `confirm_calls`, each gated call needs the user's approval through the client.
+    pub fn new(client: OshiClient, enabled: &BTreeSet<String>, confirm_calls: bool) -> Self {
         let mut tool_router = Self::tool_router();
         let mut disabled = Vec::new();
         for &name in GATED_TOOLS {
@@ -55,10 +58,18 @@ impl OshiServer {
                 disabled.join(", ")
             ));
         }
+        if confirm_calls && disabled.len() < GATED_TOOLS.len() {
+            instructions.push_str(
+                " Tools that spend sats, change campaigns or mint portal links ask the user to \
+                 approve each call in their MCP client. If the user declines, don't retry or work \
+                 around it.",
+            );
+        }
 
         Self {
             client,
             portal_links_enabled: enabled.contains("mint_portal_link"),
+            confirm_calls,
             tool_router,
             instructions,
         }
@@ -93,6 +104,30 @@ impl OshiServer {
     fn api_error(&self, mut e: ApiError) -> String {
         e.body = e.body.map(|b| self.scrub(b));
         e.to_string()
+    }
+
+    async fn fetch(&self, segments: &[&str]) -> Result<Value, String> {
+        let v = self
+            .client
+            .get(self.client.url(segments))
+            .await
+            .map_err(|e| self.api_error(e))?;
+        Ok(self.scrub(v))
+    }
+
+    /// Gets the user's approval for a gated call, unless the operator turned
+    /// confirmation off. `prompt` is only awaited once the client is known to
+    /// support approval prompts.
+    async fn approve(
+        &self,
+        peer: Option<&Peer<RoleServer>>,
+        prompt: impl Future<Output = Result<String, String>>,
+    ) -> Result<(), String> {
+        if !self.confirm_calls {
+            return Ok(());
+        }
+        let peer = confirm::require_support(peer)?;
+        confirm::ask(peer, prompt.await?).await
     }
 }
 
@@ -330,40 +365,10 @@ impl OshiServer {
     ))]
     async fn grant_reward(
         &self,
+        peer: Peer<RoleServer>,
         Parameters(p): Parameters<GrantRewardParams>,
     ) -> Result<String, String> {
-        let mut body = json!({
-            "rewards_campaign_id": p.rewards_campaign_id,
-            "user_id": identifier("user_id", &p.user_id)?,
-            "external_id": identifier("external_id", &p.external_id)?,
-        });
-        if let Some(addr) = &p.lightning_address {
-            body["lightning_address"] = lightning_address(addr)?.into();
-        }
-        if let Some(meta) = p.metadata {
-            let meta = Value::Object(meta);
-            if meta.to_string().len() > MAX_METADATA_BYTES {
-                return Err(format!(
-                    "metadata must be at most {MAX_METADATA_BYTES} bytes as JSON"
-                ));
-            }
-            body["metadata"] = meta;
-        }
-
-        let resp = self
-            .client
-            .post(self.client.url(&["events"]), Some(&body))
-            .await
-            .map_err(|e| self.api_error(e))?;
-        let resp = self.scrub(resp);
-        if resp.get("status").and_then(Value::as_str) == Some("insufficient_funds") {
-            return Ok(format!(
-                "WARNING: the campaign budget is exhausted. The event was recorded with status \
-                 insufficient_funds and will never be paid.\n{}",
-                pretty(&resp)
-            ));
-        }
-        Ok(pretty(&resp))
+        self.grant(p, Some(&peer)).await
     }
 
     /// Fetch one reward event (status, amount, timestamps) by its reward_event_id.
@@ -410,12 +415,10 @@ impl OshiServer {
     ))]
     async fn void_reward(
         &self,
+        peer: Peer<RoleServer>,
         Parameters(p): Parameters<RewardEventParams>,
     ) -> Result<String, String> {
-        let url = self
-            .client
-            .url(&["events", &p.reward_event_id.to_string(), "void"]);
-        self.finish(self.client.post(url, None).await)
+        self.void(p, Some(&peer)).await
     }
 
     /// List the merchant's API reward campaigns with amount, holding period, budget, payout
@@ -451,12 +454,10 @@ impl OshiServer {
     ))]
     async fn update_campaign(
         &self,
+        peer: Peer<RoleServer>,
         Parameters(p): Parameters<UpdateCampaignParams>,
     ) -> Result<String, String> {
-        p.validate()?;
-        let body = serde_json::to_value(&p).map_err(|e| e.to_string())?;
-        let url = self.client.url(&["campaigns", &p.campaign_id.to_string()]);
-        self.finish(self.client.patch(url, &body).await)
+        self.update(p, Some(&peer)).await
     }
 
     /// Mint a single-use sign-in link into the rewards portal for a user, valid 24 hours. The link
@@ -470,11 +471,10 @@ impl OshiServer {
     ))]
     async fn mint_portal_link(
         &self,
+        peer: Peer<RoleServer>,
         Parameters(p): Parameters<UserParams>,
     ) -> Result<String, String> {
-        let user_id = path_identifier("user_id", &p.user_id)?;
-        let url = self.client.url(&["users", &user_id, "portal-link"]);
-        self.finish(self.client.post(url, None).await)
+        self.mint(p, Some(&peer)).await
     }
 
     /// Get a rewarded user's profile, wallet balance, total rewarded, and their 100 most recent
@@ -483,6 +483,141 @@ impl OshiServer {
     async fn get_user(&self, Parameters(p): Parameters<UserParams>) -> Result<String, String> {
         let user_id = path_identifier("user_id", &p.user_id)?;
         self.finish(self.client.get(self.client.url(&["users", &user_id])).await)
+    }
+}
+
+// ---- Gated tool bodies -----------------------------------------------------
+//
+// Split from the #[tool] wrappers so tests can run them without a live peer.
+
+impl OshiServer {
+    async fn grant(
+        &self,
+        p: GrantRewardParams,
+        peer: Option<&Peer<RoleServer>>,
+    ) -> Result<String, String> {
+        let mut body = json!({
+            "rewards_campaign_id": p.rewards_campaign_id,
+            "user_id": identifier("user_id", &p.user_id)?,
+            "external_id": identifier("external_id", &p.external_id)?,
+        });
+        if let Some(addr) = &p.lightning_address {
+            body["lightning_address"] = lightning_address(addr)?.into();
+        }
+        if let Some(meta) = p.metadata {
+            let meta = Value::Object(meta);
+            if meta.to_string().len() > MAX_METADATA_BYTES {
+                return Err(format!(
+                    "metadata must be at most {MAX_METADATA_BYTES} bytes as JSON"
+                ));
+            }
+            body["metadata"] = meta;
+        }
+
+        let campaign_id = p.rewards_campaign_id.to_string();
+        let user_id = body["user_id"].as_str().unwrap_or_default().to_owned();
+        let external_id = body["external_id"].as_str().unwrap_or_default().to_owned();
+        let lightning = body["lightning_address"].as_str().map(str::to_owned);
+        self.approve(peer, async {
+            let c = self.fetch(&["campaigns", &campaign_id]).await?;
+            let c = &c["campaign"];
+            let mut prompt = format!(
+                "Approve paying {} sats from campaign {} to user {} for action {}?",
+                show_known(&c["fixed_reward_sats"]),
+                show_known(&c["name"]),
+                show_str(&user_id),
+                show_str(&external_id),
+            );
+            if let Some(addr) = &lightning {
+                prompt.push_str(&format!("\nPaid to lightning address {}.", show_str(addr)));
+            }
+            prompt.push_str(&format!(
+                "\nHeld for {} days, and can be voided until then. Reusing an action id \
+                 never pays twice.",
+                show_known(&c["holding_period_days"])
+            ));
+            Ok(prompt)
+        })
+        .await?;
+
+        let resp = self
+            .client
+            .post(self.client.url(&["events"]), Some(&body))
+            .await
+            .map_err(|e| self.api_error(e))?;
+        let resp = self.scrub(resp);
+        if resp.get("status").and_then(Value::as_str) == Some("insufficient_funds") {
+            return Ok(format!(
+                "WARNING: the campaign budget is exhausted. The event was recorded with status \
+                 insufficient_funds and will never be paid.\n{}",
+                pretty(&resp)
+            ));
+        }
+        Ok(pretty(&resp))
+    }
+
+    async fn void(
+        &self,
+        p: RewardEventParams,
+        peer: Option<&Peer<RoleServer>>,
+    ) -> Result<String, String> {
+        let id = p.reward_event_id.to_string();
+        self.approve(peer, async {
+            let e = self.fetch(&["events", &id]).await?;
+            let e = &e["event"];
+            Ok(format!(
+                "Approve voiding reward {id}: {} sats to user {} from campaign {} (status {})?\n\
+                 This can't be undone, and the issuance fee isn't refunded.",
+                show_known(&e["sats_amount"]),
+                show_known(&e["external_user_id"]),
+                show_known(&e["campaign_name"]),
+                show_known(&e["status"]),
+            ))
+        })
+        .await?;
+        let url = self.client.url(&["events", &id, "void"]);
+        self.finish(self.client.post(url, None).await)
+    }
+
+    async fn update(
+        &self,
+        p: UpdateCampaignParams,
+        peer: Option<&Peer<RoleServer>>,
+    ) -> Result<String, String> {
+        p.validate()?;
+        let body = serde_json::to_value(&p).map_err(|e| e.to_string())?;
+        let id = p.campaign_id.to_string();
+        self.approve(peer, async {
+            let c = self.fetch(&["campaigns", &id]).await?;
+            let c = &c["campaign"];
+            let changes: String = body
+                .as_object()
+                .into_iter()
+                .flatten()
+                .map(|(field, new)| format!("\n  {field}: {} -> {}", show(&c[field]), show(new)))
+                .collect();
+            Ok(format!(
+                "Approve these changes to campaign {}?{changes}",
+                show_known(&c["name"])
+            ))
+        })
+        .await?;
+        let url = self.client.url(&["campaigns", &id]);
+        self.finish(self.client.patch(url, &body).await)
+    }
+
+    async fn mint(&self, p: UserParams, peer: Option<&Peer<RoleServer>>) -> Result<String, String> {
+        let user_id = path_identifier("user_id", &p.user_id)?;
+        self.approve(peer, async {
+            Ok(format!(
+                "Approve minting a 24-hour sign-in link to the rewards wallet of user {}?\n\
+                 Anyone who opens it can withdraw that user's released sats.",
+                show_str(&user_id)
+            ))
+        })
+        .await?;
+        let url = self.client.url(&["users", &user_id, "portal-link"]);
+        self.finish(self.client.post(url, None).await)
     }
 }
 
@@ -513,7 +648,7 @@ mod tests {
         let client = OshiClient::new(&ApiKey::new("test_key").unwrap(), &mock.uri()).unwrap();
         (
             mock,
-            OshiServer::new(client, &parse_enabled_tools(enable).unwrap()),
+            OshiServer::new(client, &parse_enabled_tools(enable).unwrap(), false),
         )
     }
 
@@ -610,10 +745,7 @@ mod tests {
             .expect(1)
             .mount(&mock)
             .await;
-        let out = server
-            .grant_reward(Parameters(grant("  user_123")))
-            .await
-            .unwrap();
+        let out = server.grant(grant("  user_123"), None).await.unwrap();
         assert!(!out.contains("SECRET"), "{out}");
         assert!(out.contains("redacted"));
     }
@@ -627,7 +759,7 @@ mod tests {
             )
             .mount(&mock)
             .await;
-        let out = server.grant_reward(Parameters(grant("u"))).await.unwrap();
+        let out = server.grant(grant("u"), None).await.unwrap();
         assert!(out.contains("https://p/a/LINK"));
     }
 
@@ -640,23 +772,18 @@ mod tests {
             )
             .mount(&mock)
             .await;
-        let out = server.grant_reward(Parameters(grant("u"))).await.unwrap();
+        let out = server.grant(grant("u"), None).await.unwrap();
         assert!(out.starts_with("WARNING"), "{out}");
     }
 
     #[tokio::test]
     async fn grant_validates_inputs_before_calling_the_api() {
         let (mock, server) = setup("grant_reward").await;
-        assert!(server.grant_reward(Parameters(grant(""))).await.is_err());
-        assert!(
-            server
-                .grant_reward(Parameters(grant(&"x".repeat(256))))
-                .await
-                .is_err()
-        );
+        assert!(server.grant(grant(""), None).await.is_err());
+        assert!(server.grant(grant(&"x".repeat(256)), None).await.is_err());
         let mut p = grant("u");
         p.lightning_address = Some("not an address".into());
-        assert!(server.grant_reward(Parameters(p)).await.is_err());
+        assert!(server.grant(p, None).await.is_err());
         assert!(mock.received_requests().await.unwrap().is_empty());
     }
 
@@ -674,7 +801,7 @@ mod tests {
             .mount(&mock)
             .await;
         server
-            .mint_portal_link(Parameters(UserParams { user_id: hostile }))
+            .mint(UserParams { user_id: hostile }, None)
             .await
             .unwrap();
 
@@ -721,7 +848,7 @@ mod tests {
             "campaign_id": CAMPAIGN, "fixed_reward_sats": 250, "end_at": null,
         }))
         .unwrap();
-        server.update_campaign(Parameters(p)).await.unwrap();
+        server.update(p, None).await.unwrap();
     }
 
     #[tokio::test]
@@ -735,10 +862,7 @@ mod tests {
         ];
         for case in cases {
             let p: UpdateCampaignParams = serde_json::from_value(case.clone()).unwrap();
-            assert!(
-                server.update_campaign(Parameters(p)).await.is_err(),
-                "{case}"
-            );
+            assert!(server.update(p, None).await.is_err(), "{case}");
         }
         assert!(mock.received_requests().await.unwrap().is_empty());
 
