@@ -2,7 +2,7 @@
 
 An [MCP](https://modelcontextprotocol.io) server for [Oshi API Rewards](https://app.oshi.tech/docs/api), which pays your app's users in real bitcoin. It lets an AI agent look up campaigns, rewards and users, and grant or void rewards once you allow it to.
 
-It's a single static binary with no runtime dependencies. It's **read-only by default**: tools that spend sats stay hidden until you turn them on.
+It's a single static binary with no runtime dependencies. It's **read-only by default**: tools that spend sats stay hidden until you turn them on. Once they're on, every call needs your approval and leaves a record in an [audit log](#audit-log).
 
 > Independent open-source project, not affiliated with or endorsed by Oshi.
 
@@ -102,9 +102,11 @@ For unattended use, or a client without elicitation support, turn approval off o
 
 Any value other than `on` or `off` stops the server from starting.
 
-### Audit log
+## Audit log
 
-Every call to those tools writes one JSON line to stderr, whatever happens: approved, declined, rejected, failed, or unknown (for example a timeout). Most MCP clients save a server's stderr to a log file. Here's a record, wrapped for reading:
+Every call to a tool that's off by default (`grant_reward`, `void_reward`, `update_campaign`, `mint_portal_link`) writes one JSON line to the server's stderr. That happens whatever the result, so declined, rejected, failed and timed-out calls are recorded too. Read-only tools aren't logged.
+
+Here's a record, wrapped for reading:
 
 ```json
 {"approval":"approved","audit":"oshi-mcp","campaign_id":"72cb8983-…","campaign_name":"App Referral",
@@ -112,11 +114,61 @@ Every call to those tools writes one JSON line to stderr, whatever happens: appr
  "sats":100,"status":"pending","tool":"grant_reward","ts":"2026-10-18T14:03:12.500Z","user_id":"user_123"}
 ```
 
-`outcome` is one of `ok`, `invalid_input`, `not_approved`, `failed` or `outcome_unknown`. `approval` is `approved`, `not_required` (when `OSHI_MCP_CONFIRM=off`), or `not_given`. Records contain identifiers, amounts, statuses and Oshi's error messages. They never include the API key, metadata or portal links. Read-only tools aren't logged.
+| Field | Meaning |
+|---|---|
+| `ts`, `tool` | When (UTC) and which tool |
+| `outcome` | `ok`, `invalid_input` (rejected before anything was sent), `not_approved`, `failed` (Oshi said no), or `outcome_unknown` (it may have happened; see below) |
+| `approval` | `approved` by you, `not_required` (`OSHI_MCP_CONFIRM=off`), or `not_given` |
+| `campaign_id`, `user_id`, `external_id`, `reward_event_id` | What the call was about |
+| `sats`, `status`, `issuance_fee_sats`, `voided_at`, `expires_at` | What Oshi reported back |
+| `changes`, `before` | For `update_campaign`: the new values and the old ones |
+| `error` | Why it didn't succeed |
 
-To pull the audit records out of a client's log, filter on `"audit":"oshi-mcp"`.
+Records never contain the API key, reward metadata or portal links.
 
-The Shopify purchase-verification endpoints aren't covered yet.
+### Where the log goes
+
+stdout carries the MCP protocol, so the server can only log to stderr, and **your MCP client decides what happens to it**. Claude Desktop, for example, saves each server's stderr to `~/Library/Logs/Claude/mcp-server-<name>.log` on macOS. Other clients may only show it in a panel, or drop it.
+
+To keep a log you control, whatever the client, point your client at a small wrapper script instead of the binary:
+
+```sh
+#!/bin/sh
+# ~/.local/bin/oshi-mcp-logged: runs oshi-mcp, appending its stderr to a file.
+log_dir="${XDG_STATE_HOME:-$HOME/.local/state}/oshi-mcp"
+mkdir -p "$log_dir" && chmod 700 "$log_dir"
+exec oshi-mcp "$@" 2>>"$log_dir/stderr.log"
+```
+
+```bash
+chmod +x ~/.local/bin/oshi-mcp-logged
+claude mcp add --transport stdio --env OSHI_API_KEY=your_key oshi -- ~/.local/bin/oshi-mcp-logged
+```
+
+For other clients, use the wrapper's absolute path as `command`. stdout is untouched, so the protocol works as normal. The file also gets the server's one-line startup message, which is why the commands below filter on `"audit":"oshi-mcp"` first.
+
+### What to do with it
+
+Some starting points, with [`jq`](https://jqlang.org):
+
+```bash
+LOG=~/.local/state/oshi-mcp/stderr.log
+audit() { grep '"audit":"oshi-mcp"' "$LOG"; }
+
+# Every write, as a table
+audit | jq -r '[.ts, .tool, .outcome, .user_id // "", .sats // ""] | @tsv'
+
+# Calls whose result is unknown: check each with lookup_reward before anyone retries
+audit | jq -c 'select(.outcome == "outcome_unknown")'
+
+# Sats granted (successful grants only)
+audit | jq -s 'map(select(.tool == "grant_reward" and .outcome == "ok") | .sats // 0) | add'
+
+# Anything refused or rejected, to spot an agent that keeps trying
+audit | jq -c 'select(.outcome == "not_approved" or .outcome == "invalid_input")'
+```
+
+Because every line is self-contained JSON, any log shipper (Vector, Fluent Bit, the Datadog or CloudWatch agents) can take the file as is.
 
 ## Security model
 
@@ -126,11 +178,19 @@ The Shopify purchase-verification endpoints aren't covered yet.
 - **Strict inputs.** Ids are percent-encoded per path segment, so a crafted `user_id` like `x/../../events/<id>/void` can't reach a different endpoint. UUIDs, lengths and ranges are checked locally, and unknown arguments are rejected instead of dropped.
 - **The key stays in one place.** It's read from `OSHI_API_KEY`, sent only as a bearer header to `https://app.oshi.tech`, never logged, and redacted from debug output. Redirects aren't followed. The API base URL is compiled in, with no override.
 - **Hints for your client.** Each tool carries MCP annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`, and `openWorldHint` since every tool calls an outside service), so clients that have their own permission prompts can use them too.
-- **An audit trail.** Every write attempt leaves a stderr record of the tool, identifiers, amount, approval and outcome, for review afterwards.
+- **An audit trail.** Every write attempt leaves a record of the tool, identifiers, amount, approval and outcome, for review afterwards. See [Audit log](#audit-log).
 - **Honest errors.** Oshi's error message and field errors reach the agent as they are; HTML error pages are summarized rather than dumped into its context. When a request may have taken effect but the result is unknown (a timeout, a 5xx, an unreadable reply), the error says so, and a failed grant tells the agent to check or retry with the *same* `external_id`, never a new one.
 - **Treat results as untrusted.** They contain strings that you and your users wrote, such as campaign names and metadata. The server's instructions tell the agent to treat them as data, not instructions.
 
 Oshi's own safeguards still apply: rewards are held 30–90 days and can be voided during the hold, and only bitcoin-loaded sats can fund them.
+
+## Roadmap
+
+Not built yet, roughly in priority order. Issues and PRs are welcome.
+
+- **Verification against a live merchant account.** Everything is tested against Oshi's published spec, mocks and real error responses from the live API, but not yet against a funded merchant account. If you have one, a report of what works (or doesn't) would help a lot.
+- **Shopify purchase verification.** Oshi's optional endpoints for campaigns that require a real Shopify purchase aren't covered: `POST /validate-token`, `POST /users/link`, and `GET /campaigns/{id}/eligibility`. Grants on those campaigns may fail with `user_not_linked` or `not_eligible` until they are.
+- **A built-in audit log file**, e.g. `OSHI_MCP_AUDIT_LOG=/path/to/audit.jsonl`, so you don't need the wrapper script.
 
 ## Agent skill
 
