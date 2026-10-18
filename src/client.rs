@@ -1,6 +1,6 @@
 //! Thin HTTP client for the Oshi API Rewards REST API.
 
-use std::time::Duration;
+use std::{fmt, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use reqwest::{
@@ -60,21 +60,25 @@ impl OshiClient {
         url
     }
 
-    pub async fn get(&self, url: Url) -> Result<Value, String> {
+    pub async fn get(&self, url: Url) -> Result<Value, ApiError> {
         self.send(Method::GET, url, None).await
     }
 
-    pub async fn post(&self, url: Url, body: Option<&Value>) -> Result<Value, String> {
+    pub async fn post(&self, url: Url, body: Option<&Value>) -> Result<Value, ApiError> {
         self.send(Method::POST, url, body).await
     }
 
-    pub async fn patch(&self, url: Url, body: &Value) -> Result<Value, String> {
+    pub async fn patch(&self, url: Url, body: &Value) -> Result<Value, ApiError> {
         self.send(Method::PATCH, url, Some(body)).await
     }
 
-    /// Sends a request and returns the JSON body, or a message suitable for
-    /// showing to the model as a tool error.
-    async fn send(&self, method: Method, url: Url, body: Option<&Value>) -> Result<Value, String> {
+    /// Sends a request and returns the JSON body.
+    async fn send(
+        &self,
+        method: Method,
+        url: Url,
+        body: Option<&Value>,
+    ) -> Result<Value, ApiError> {
         let mut req = self.http.request(method, url);
         if let Some(body) = body {
             req = req.json(body);
@@ -82,7 +86,7 @@ impl OshiClient {
         let resp = req
             .send()
             .await
-            .map_err(|e| format!("request to Oshi failed: {}", e.without_url()))?;
+            .map_err(|e| ApiError::new(format!("request to Oshi failed: {}", e.without_url())))?;
 
         let status = resp.status();
         let retry_after = resp
@@ -99,26 +103,63 @@ impl OshiClient {
             return Ok(Value::Null);
         }
         serde_json::from_slice(&bytes)
-            .map_err(|e| format!("Oshi returned invalid JSON ({status}): {e}"))
+            .map_err(|e| ApiError::new(format!("Oshi returned invalid JSON ({status}): {e}")))
     }
 }
 
-async fn read_capped(mut resp: Response) -> Result<Vec<u8>, String> {
+/// A failed API call. The response body is kept apart from the message so
+/// callers can filter it (e.g. redact credentials) before it reaches the model.
+#[derive(Debug)]
+pub struct ApiError {
+    pub message: String,
+    /// The error response body: parsed JSON, or the raw text as a JSON string.
+    pub body: Option<Value>,
+}
+
+impl ApiError {
+    fn new(message: String) -> Self {
+        Self {
+            message,
+            body: None,
+        }
+    }
+}
+
+impl fmt::Display for ApiError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)?;
+        let body = match &self.body {
+            None => return Ok(()),
+            Some(Value::String(text)) => text.clone(),
+            Some(v) => v.to_string(),
+        };
+        let shown: String = body.chars().take(MAX_ERROR_BODY_CHARS).collect();
+        write!(f, ": {shown}")?;
+        if shown.len() < body.len() {
+            f.write_str("…")?;
+        }
+        Ok(())
+    }
+}
+
+async fn read_capped(mut resp: Response) -> Result<Vec<u8>, ApiError> {
     let mut buf = Vec::new();
     while let Some(chunk) = resp
         .chunk()
         .await
-        .map_err(|e| format!("reading Oshi response failed: {}", e.without_url()))?
+        .map_err(|e| ApiError::new(format!("reading Oshi response failed: {}", e.without_url())))?
     {
         if buf.len() + chunk.len() > MAX_RESPONSE_BYTES {
-            return Err(format!("Oshi response exceeded {MAX_RESPONSE_BYTES} bytes"));
+            return Err(ApiError::new(format!(
+                "Oshi response exceeded {MAX_RESPONSE_BYTES} bytes"
+            )));
         }
         buf.extend_from_slice(&chunk);
     }
     Ok(buf)
 }
 
-fn describe_error(status: StatusCode, retry_after: Option<&str>, body: &[u8]) -> String {
+fn describe_error(status: StatusCode, retry_after: Option<&str>, body: &[u8]) -> ApiError {
     let mut msg = format!("Oshi API returned {status}");
     match status {
         StatusCode::UNAUTHORIZED => msg.push_str(" (check that OSHI_API_KEY is correct)"),
@@ -131,14 +172,9 @@ fn describe_error(status: StatusCode, retry_after: Option<&str>, body: &[u8]) ->
     }
     let text = String::from_utf8_lossy(body);
     let text = text.trim();
-    if !text.is_empty() {
-        msg.push_str(": ");
-        msg.extend(text.chars().take(MAX_ERROR_BODY_CHARS));
-        if text.chars().count() > MAX_ERROR_BODY_CHARS {
-            msg.push('…');
-        }
-    }
-    msg
+    let body = (!text.is_empty())
+        .then(|| serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.to_owned())));
+    ApiError { message: msg, body }
 }
 
 #[cfg(test)]
@@ -204,7 +240,7 @@ mod tests {
             .mount(&server)
             .await;
         let c = client(&server.uri());
-        let err = c.get(c.url(&["campaigns"])).await.unwrap_err();
+        let err = c.get(c.url(&["campaigns"])).await.unwrap_err().to_string();
         assert!(err.contains("302") && err.contains("not followed"), "{err}");
     }
 
@@ -220,7 +256,7 @@ mod tests {
             .mount(&server)
             .await;
         let c = client(&server.uri());
-        let err = c.get(c.url(&["campaigns"])).await.unwrap_err();
+        let err = c.get(c.url(&["campaigns"])).await.unwrap_err().to_string();
         assert!(err.contains("retry after 17 seconds"), "{err}");
         assert!(err.contains("Rate limit exceeded."), "{err}");
     }
@@ -233,7 +269,11 @@ mod tests {
             .mount(&server)
             .await;
         let c = client(&server.uri());
-        let err = c.post(c.url(&["events"]), None).await.unwrap_err();
+        let err = c
+            .post(c.url(&["events"]), None)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.starts_with("Oshi API returned 422"));
         assert!(err.len() < 2100, "error body should be truncated");
     }
@@ -248,7 +288,7 @@ mod tests {
             .mount(&server)
             .await;
         let c = client(&server.uri());
-        let err = c.get(c.url(&["campaigns"])).await.unwrap_err();
+        let err = c.get(c.url(&["campaigns"])).await.unwrap_err().to_string();
         assert!(err.contains("exceeded"), "{err}");
     }
 }

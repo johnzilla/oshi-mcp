@@ -88,7 +88,7 @@ The Shopify purchase-verification endpoints aren't covered yet.
 ## Security model
 
 - **Least privilege by default.** Tools you haven't enabled are left out of the tool list entirely, and calls to them are refused. The server tells the agent to ask you rather than work around it.
-- **Portal links are credentials.** A portal link signs whoever opens it into the user's wallet. Unless `mint_portal_link` is enabled, the `portal_url` that `grant_reward` returns is redacted.
+- **Portal links are credentials.** A portal link signs whoever opens it into the user's wallet. Unless `mint_portal_link` is enabled, every tool result and API error is scanned at any depth: portal-link fields and anything shaped like a portal link are redacted, wherever they appear.
 - **Strict inputs.** Ids are percent-encoded per path segment, so a crafted `user_id` like `x/../../events/<id>/void` can't reach a different endpoint. UUIDs, lengths and ranges are checked locally, and unknown arguments are rejected instead of dropped.
 - **The key stays in one place.** It's read from `OSHI_API_KEY`, sent only as a bearer header to `https://app.oshi.tech`, never logged, and redacted from debug output. Redirects aren't followed. The API base URL is compiled in, with no override.
 - **Hints for your client.** Each tool carries MCP annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`), so clients can ask before write actions.
@@ -107,7 +107,7 @@ cargo test      # unit tests plus end-to-end MCP tests against a mocked Oshi API
 cargo clippy --all-targets -- -D warnings
 ```
 
-To release, bump `version` in `Cargo.toml`, then commit, tag and push (`git tag v0.1.1 && git push --tags`). The workflow builds macOS, Linux (static musl) and Windows binaries, then creates a **draft** release with `SHA256SUMS` and attestations. Review it and publish it. Then run `cargo publish` so `cargo binstall` can find the crate.
+To release, bump `version` in `Cargo.toml`, commit to `main`, then tag and push (`git tag -a v0.1.1 -m v0.1.1 && git push origin v0.1.1`). The workflow refuses tags that aren't on `main` or don't match the version, and reruns the full CI suite before building. It builds macOS, Linux (static musl) and Windows binaries, then creates a **draft** release with `SHA256SUMS` and attestations. Publish that draft rather than creating a release by hand. Then run `cargo publish --locked`.
 
 ## License
 

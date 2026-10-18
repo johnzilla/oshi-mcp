@@ -13,11 +13,13 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
-use crate::{client::OshiClient, config::GATED_TOOLS};
+use crate::{
+    client::{ApiError, OshiClient},
+    config::GATED_TOOLS,
+    redact,
+};
 
 const MAX_METADATA_BYTES: usize = 16 * 1024;
-const REDACTED_PORTAL_URL: &str =
-    "<redacted: enable the mint_portal_link tool to receive portal links>";
 
 #[derive(Clone)]
 pub struct OshiServer {
@@ -70,16 +72,27 @@ impl OshiServer {
             .collect()
     }
 
-    /// The grant response carries a single-use sign-in link into the user's
-    /// wallet. Hide it unless the operator opted into portal links.
-    fn redact_portal_url(&self, mut v: Value) -> Value {
-        if !self.portal_links_enabled
-            && let Some(obj) = v.as_object_mut()
-            && obj.get("portal_url").is_some_and(|u| !u.is_null())
-        {
-            obj.insert("portal_url".into(), REDACTED_PORTAL_URL.into());
+    /// Portal links sign the holder into a user's wallet. Unless the operator
+    /// opted into them, they are stripped from everything a tool returns.
+    fn scrub(&self, v: Value) -> Value {
+        if self.portal_links_enabled {
+            v
+        } else {
+            redact::value(v)
         }
-        v
+    }
+
+    /// Renders an API result as a tool result. Every tool's API response and
+    /// API error goes through here (or `scrub`), so none can skip redaction.
+    fn finish(&self, result: Result<Value, ApiError>) -> Result<String, String> {
+        result
+            .map(|v| pretty(&self.scrub(v)))
+            .map_err(|e| self.api_error(e))
+    }
+
+    fn api_error(&self, mut e: ApiError) -> String {
+        e.body = e.body.map(|b| self.scrub(b));
+        e.to_string()
     }
 }
 
@@ -337,11 +350,12 @@ impl OshiServer {
             body["metadata"] = meta;
         }
 
-        let resp = self.redact_portal_url(
-            self.client
-                .post(self.client.url(&["events"]), Some(&body))
-                .await?,
-        );
+        let resp = self
+            .client
+            .post(self.client.url(&["events"]), Some(&body))
+            .await
+            .map_err(|e| self.api_error(e))?;
+        let resp = self.scrub(resp);
         if resp.get("status").and_then(Value::as_str) == Some("insufficient_funds") {
             return Ok(format!(
                 "WARNING: the campaign budget is exhausted. The event was recorded with status \
@@ -359,7 +373,7 @@ impl OshiServer {
         Parameters(p): Parameters<RewardEventParams>,
     ) -> Result<String, String> {
         let url = self.client.url(&["events", &p.reward_event_id.to_string()]);
-        Ok(pretty(&self.client.get(url).await?))
+        self.finish(self.client.get(url).await)
     }
 
     /// Look up reward events by the external_id (idempotency key) they were granted with,
@@ -380,7 +394,7 @@ impl OshiServer {
             url.query_pairs_mut()
                 .append_pair("rewards_campaign_id", &cid.to_string());
         }
-        Ok(pretty(&self.client.get(url).await?))
+        self.finish(self.client.get(url).await)
     }
 
     /// Void a reward that is still `pending` (within its holding period), e.g. for a refund or
@@ -401,7 +415,7 @@ impl OshiServer {
         let url = self
             .client
             .url(&["events", &p.reward_event_id.to_string(), "void"]);
-        Ok(pretty(&self.client.post(url, None).await?))
+        self.finish(self.client.post(url, None).await)
     }
 
     /// List the merchant's API reward campaigns with amount, holding period, budget, payout
@@ -412,9 +426,7 @@ impl OshiServer {
         open_world_hint = false
     ))]
     async fn list_campaigns(&self) -> Result<String, String> {
-        Ok(pretty(
-            &self.client.get(self.client.url(&["campaigns"])).await?,
-        ))
+        self.finish(self.client.get(self.client.url(&["campaigns"])).await)
     }
 
     /// Get one campaign by its campaign_id.
@@ -424,7 +436,7 @@ impl OshiServer {
         Parameters(p): Parameters<CampaignParams>,
     ) -> Result<String, String> {
         let url = self.client.url(&["campaigns", &p.campaign_id.to_string()]);
-        Ok(pretty(&self.client.get(url).await?))
+        self.finish(self.client.get(url).await)
     }
 
     /// Partially update a campaign; omitted fields keep their value. Changes how many sats every
@@ -444,7 +456,7 @@ impl OshiServer {
         p.validate()?;
         let body = serde_json::to_value(&p).map_err(|e| e.to_string())?;
         let url = self.client.url(&["campaigns", &p.campaign_id.to_string()]);
-        Ok(pretty(&self.client.patch(url, &body).await?))
+        self.finish(self.client.patch(url, &body).await)
     }
 
     /// Mint a single-use sign-in link into the rewards portal for a user, valid 24 hours. The link
@@ -462,7 +474,7 @@ impl OshiServer {
     ) -> Result<String, String> {
         let user_id = path_identifier("user_id", &p.user_id)?;
         let url = self.client.url(&["users", &user_id, "portal-link"]);
-        Ok(pretty(&self.client.post(url, None).await?))
+        self.finish(self.client.post(url, None).await)
     }
 
     /// Get a rewarded user's profile, wallet balance, total rewarded, and their 100 most recent
@@ -470,12 +482,7 @@ impl OshiServer {
     #[tool(annotations(title = "Get user", read_only_hint = true, open_world_hint = false))]
     async fn get_user(&self, Parameters(p): Parameters<UserParams>) -> Result<String, String> {
         let user_id = path_identifier("user_id", &p.user_id)?;
-        Ok(pretty(
-            &self
-                .client
-                .get(self.client.url(&["users", &user_id]))
-                .await?,
-        ))
+        self.finish(self.client.get(self.client.url(&["users", &user_id])).await)
     }
 }
 
