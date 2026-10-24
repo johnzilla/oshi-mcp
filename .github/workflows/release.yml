@@ -1,8 +1,7 @@
-# Builds release binaries for a pushed `v*` tag and attaches them, with
-# SHA256SUMS and build-provenance attestations, to a draft GitHub Release.
+# Builds release binaries for a pushed `v*` tag and publishes them, with
+# SHA256SUMS and build-provenance attestations, as the latest GitHub Release.
 # Nothing is built unless the tag points at a commit on main, matches the
-# Cargo.toml version, and passes the full CI suite. Review the draft, then
-# publish it.
+# Cargo.toml version, passes the tests, and has no known advisories.
 name: Release
 
 on:
@@ -40,8 +39,11 @@ jobs:
   ci:
     uses: ./.github/workflows/ci.yml
 
+  audit:
+    uses: ./.github/workflows/audit.yml
+
   build:
-    needs: [verify-tag, ci]
+    needs: [verify-tag, ci, audit]
     name: build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     strategy:
@@ -110,7 +112,7 @@ jobs:
         with:
           subject-path: dist/oshi-mcp-*
 
-      - name: Create draft release
+      - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --draft --verify-tag --generate-notes --title "$GITHUB_REF_NAME"
+        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes --title "$GITHUB_REF_NAME"

@@ -1,11 +1,13 @@
-# New advisories appear without any code change, so check the lockfile daily
-# too, not just on pushes.
+# Checks Cargo.lock against RustSec advisories. New advisories appear without
+# any code change, so this runs weekly, and every release runs it too so a
+# binary with a known vulnerability doesn't ship.
 name: Audit
 
 on:
   schedule:
-    - cron: "17 6 * * *"
+    - cron: "17 6 * * 1" # Mondays
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
