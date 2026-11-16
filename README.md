@@ -204,11 +204,11 @@ cargo clippy --all-targets -- -D warnings
 cargo audit     # RustSec advisories (cargo install cargo-audit)
 ```
 
-Pushes to `main` run the tests on Linux, macOS and Windows. `cargo audit` runs every Monday, since new advisories don't need a code change, and before every release.
+Pushes to `main` run the tests on Linux, macOS and Windows. Nothing runs on a schedule.
 
 `tests/errors.rs` replays error responses recorded from the live API (including ones the spec doesn't list, like its HTML 404 page and a 308 redirect), plus network failures and approval-step failures.
 
-To release, bump `version` in `Cargo.toml`, commit to `main`, then tag and push (`git tag -a vX.Y.Z -m vX.Y.Z && git push origin vX.Y.Z`). The workflow refuses tags that aren't on `main` or don't match the version, and needs the tests and `cargo audit` to pass. It then builds macOS, Linux (static musl) and Windows binaries and publishes the release, with `SHA256SUMS` and attestations, as the latest. Don't create releases by hand. Then run `cargo publish --locked`.
+To release, bump `version` in `Cargo.toml`, commit to `main`, then tag and push (`git tag -a vX.Y.Z -m vX.Y.Z && git push origin vX.Y.Z`). The workflow refuses tags that aren't on `main` or don't match the version, and needs the tests to pass. It then builds macOS, Linux (static musl) and Windows binaries and publishes the release, with `SHA256SUMS` and attestations, as the latest. Don't create releases by hand. Then run `cargo publish --locked`.
 
 ## License
 

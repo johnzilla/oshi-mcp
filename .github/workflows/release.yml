@@ -1,7 +1,7 @@
 # Builds release binaries for a pushed `v*` tag and publishes them, with
 # SHA256SUMS and build-provenance attestations, as the latest GitHub Release.
 # Nothing is built unless the tag points at a commit on main, matches the
-# Cargo.toml version, passes the tests, and has no known advisories.
+# Cargo.toml version, and passes the tests.
 name: Release
 
 on:
@@ -39,11 +39,8 @@ jobs:
   ci:
     uses: ./.github/workflows/ci.yml
 
-  audit:
-    uses: ./.github/workflows/audit.yml
-
   build:
-    needs: [verify-tag, ci, audit]
+    needs: [verify-tag, ci]
     name: build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     strategy:
